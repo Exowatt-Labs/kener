@@ -21,6 +21,14 @@ interface BatchState {
 
 const pendingBatches = new Map<string, BatchState>();
 
+/**
+ * Exowatt patch: the server rejects requests with more than 100 tags
+ * (MAX_TAGS in src/lib/server/api-server/monitor-bars/get.ts), which made
+ * every tile fail on pages with >100 monitors. Split the batch into
+ * <=100-tag chunks and fire them in parallel instead.
+ */
+const MAX_TAGS_PER_REQUEST = 100;
+
 /** In-memory cache: survives across component mounts, cleared on page refresh */
 const cache = new Map<string, MonitorBarResponse>();
 
@@ -39,32 +47,45 @@ const flushBatch = async (key: string): Promise<void> => {
   const days = Number(daysStr);
   const endOfDayTodayAtTz = Number(endTsStr);
 
-  try {
-    const query = `?tags=${encodeURIComponent(tags.join(","))}&endOfDayTodayAtTz=${endOfDayTodayAtTz}&days=${days}`;
-    const response = await fetch(clientResolver(resolve, "/dashboard-apis/monitor-bars") + query);
-
-    if (!response.ok) {
-      throw new Error("Failed to fetch monitor bars");
-    }
-
-    const payload = (await response.json()) as MonitorBarsResponse;
-
-    for (const tag of tags) {
-      const waiters = batch.waitersByTag.get(tag) || [];
-      const item = payload.data[tag];
-      if (item) {
-        cache.set(makeCacheKey(tag, days, endOfDayTodayAtTz), item);
-        waiters.forEach((w) => w.resolve(item));
-      } else {
-        const missingError = new Error(`Monitor data not found for tag: ${tag}`);
-        waiters.forEach((w) => w.reject(missingError));
-      }
-    }
-  } catch (err) {
-    for (const waiters of batch.waitersByTag.values()) {
-      waiters.forEach((w) => w.reject(err));
-    }
+  // Exowatt patch: chunk to respect the server's 100-tag cap. Each chunk
+  // resolves/rejects only its own tags, so one failed chunk can't take down
+  // every tile on the page.
+  const chunks: string[][] = [];
+  for (let i = 0; i < tags.length; i += MAX_TAGS_PER_REQUEST) {
+    chunks.push(tags.slice(i, i + MAX_TAGS_PER_REQUEST));
   }
+
+  await Promise.all(
+    chunks.map(async (chunkTags) => {
+      try {
+        const query = `?tags=${encodeURIComponent(chunkTags.join(","))}&endOfDayTodayAtTz=${endOfDayTodayAtTz}&days=${days}`;
+        const response = await fetch(clientResolver(resolve, "/dashboard-apis/monitor-bars") + query);
+
+        if (!response.ok) {
+          throw new Error("Failed to fetch monitor bars");
+        }
+
+        const payload = (await response.json()) as MonitorBarsResponse;
+
+        for (const tag of chunkTags) {
+          const waiters = batch.waitersByTag.get(tag) || [];
+          const item = payload.data[tag];
+          if (item) {
+            cache.set(makeCacheKey(tag, days, endOfDayTodayAtTz), item);
+            waiters.forEach((w) => w.resolve(item));
+          } else {
+            const missingError = new Error(`Monitor data not found for tag: ${tag}`);
+            waiters.forEach((w) => w.reject(missingError));
+          }
+        }
+      } catch (err) {
+        for (const tag of chunkTags) {
+          const waiters = batch.waitersByTag.get(tag) || [];
+          waiters.forEach((w) => w.reject(err));
+        }
+      }
+    }),
+  );
 };
 
 export const requestMonitorBar = (
