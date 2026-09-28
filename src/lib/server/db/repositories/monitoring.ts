@@ -9,6 +9,27 @@ import type {
   TimestampStatusCount,
   TimestampStatusCountByMonitor,
 } from "../../types/db.js";
+import {
+  advanceRollup,
+  aggregateWithRollup,
+  deleteRollupRange,
+  mayBeBelowWatermark,
+  oldestRawTimestamp,
+  rebuildRollupRange,
+  type AdvanceRollupResult,
+  type GroupedStatusSums,
+} from "./monitoringRollup.js";
+
+const toTimestampStatusCount = (row: GroupedStatusSums): TimestampStatusCount => ({
+  ts: row.ts,
+  countOfUp: row.countOfUp,
+  countOfDown: row.countOfDown,
+  countOfDegraded: row.countOfDegraded,
+  countOfMaintenance: row.countOfMaintenance,
+  avgLatency: row.latencyCount > 0 ? row.latencySum / row.latencyCount : 0,
+  maxLatency: row.latencyMax ?? 0,
+  minLatency: row.latencyMin ?? 0,
+});
 
 /**
  * Sample types alert evaluation can see (see docs/adr/0005-alerts-evaluate-alert-visible-samples.md).
@@ -46,6 +67,12 @@ export class MonitoringRepository extends BaseRepository {
       .insert({ monitor_tag, timestamp, status, latency, type, error_message, raw_status })
       .onConflict(["monitor_tag", "timestamp"])
       .merge({ status, latency, type, error_message, raw_status });
+
+    // Live inserts land above the rollup watermark; only a late/back-dated one
+    // needs its possibly-materialised bucket re-derived.
+    if (mayBeBelowWatermark(timestamp, Math.floor(Date.now() / 1000))) {
+      await rebuildRollupRange(this.knex, timestamp, timestamp + 1, [monitor_tag]);
+    }
 
     // Query and return the inserted/updated record (works consistently across all databases)
     const record = await this.knex("monitoring_data")
@@ -382,6 +409,18 @@ export class MonitoringRepository extends BaseRepository {
     timestamps: number[],
     confirmThreshold: number | null,
   ): Promise<number> {
+    const updated = await this.backfillConfirmedStatusRows(monitor_tag, timestamps, confirmThreshold);
+    if (updated > 0) {
+      await rebuildRollupRange(this.knex, Math.min(...timestamps), Math.max(...timestamps) + 1, [monitor_tag]);
+    }
+    return updated;
+  }
+
+  private async backfillConfirmedStatusRows(
+    monitor_tag: string,
+    timestamps: number[],
+    confirmThreshold: number | null,
+  ): Promise<number> {
     if (timestamps.length === 0) return 0;
 
     // Recovery (confirmed UP): rows become the UP side — clear any held error text in one update.
@@ -459,7 +498,7 @@ export class MonitoringRepository extends BaseRepository {
 
     const batchSize = 500;
 
-    return await this.knex.transaction(async (trx: KnexType.Transaction) => {
+    const written = await this.knex.transaction(async (trx: KnexType.Transaction) => {
       const results: unknown[] = [];
 
       for (let i = 0; i < records.length; i += batchSize) {
@@ -474,6 +513,11 @@ export class MonitoringRepository extends BaseRepository {
 
       return results;
     });
+
+    if (timestamps.length > 0) {
+      await rebuildRollupRange(this.knex, start, timestamps[timestamps.length - 1] + 1, [monitor_tag]);
+    }
+    return written;
   }
 
   async deleteMonitorDataByTag(tag?: string, start?: number, end?: number): Promise<number> {
@@ -487,7 +531,15 @@ export class MonitoringRepository extends BaseRepository {
     if (end !== undefined) {
       query.where("timestamp", "<=", end);
     }
-    return await query.del();
+    const oldestBeforeDelete = await oldestRawTimestamp(this.knex).catch(() => null);
+    const deleted = await query.del();
+    await deleteRollupRange(this.knex, tag, start, end, oldestBeforeDelete);
+    return deleted;
+  }
+
+  /** Scheduler hook: advance the monitor-bars rollup (see monitoringRollup.ts). */
+  async advanceMonitoringRollup(nowTs: number): Promise<AdvanceRollupResult> {
+    return await advanceRollup(this.knex, nowTs);
   }
 
   /**
@@ -504,78 +556,31 @@ export class MonitoringRepository extends BaseRepository {
     intervalInSeconds: number,
     numberOfPoints: number,
   ): Promise<Array<TimestampStatusCount>> {
-    const endTimestamp = startTimestamp + numberOfPoints * intervalInSeconds;
-
-    // Determine database client to use appropriate timestamp arithmetic
-    // SQLite uses CAST(... as INT), others (PG, MySQL) use FLOOR()
-    const client = (this.knex.client as any).config.client;
-    const isSQLite = client === "better-sqlite3" || client === "sqlite3";
-
-    let tsExpression = "";
-    if (isSQLite) {
-      tsExpression = `CAST((timestamp - ?) / ? AS INT) * ? + ?`;
-    } else {
-      tsExpression = `FLOOR((timestamp - ?) / ?) * ? + ?`;
+    // Served from the 15-minute rollup below its watermark, raw rows above it
+    // (see monitoringRollup.ts); a single tag or a tag set summed per interval.
+    const tags = Array.isArray(monitorTag) ? monitorTag : [monitorTag];
+    const grouped = await aggregateWithRollup(this.knex, tags, startTimestamp, intervalInSeconds, numberOfPoints);
+    const byTs = new Map<number, GroupedStatusSums>();
+    for (const row of grouped) {
+      const prev = byTs.get(row.ts);
+      if (!prev) {
+        byTs.set(row.ts, { ...row, monitor_tag: "" });
+        continue;
+      }
+      prev.countOfUp += row.countOfUp;
+      prev.countOfDown += row.countOfDown;
+      prev.countOfDegraded += row.countOfDegraded;
+      prev.countOfMaintenance += row.countOfMaintenance;
+      prev.latencySum += row.latencySum;
+      prev.latencyCount += row.latencyCount;
+      if (row.latencyMin !== null)
+        prev.latencyMin = prev.latencyMin === null ? row.latencyMin : Math.min(prev.latencyMin, row.latencyMin);
+      if (row.latencyMax !== null)
+        prev.latencyMax = prev.latencyMax === null ? row.latencyMax : Math.max(prev.latencyMax, row.latencyMax);
     }
-
-    // Handle single tag or array of tags
-    const isArray = Array.isArray(monitorTag);
-    const tagClause = isArray ? `monitor_tag IN (${monitorTag.map(() => "?").join(", ")})` : `monitor_tag = ?`;
-    // Use snake_case aliases for cross-database compatibility (PostgreSQL lowercases unquoted identifiers)
-    const sql = `
-      SELECT 
-        ${tsExpression} as ts,
-        SUM(CASE WHEN status = 'UP' THEN 1 ELSE 0 END) AS count_of_up,
-        SUM(CASE WHEN status = 'DOWN' THEN 1 ELSE 0 END) AS count_of_down,
-        SUM(CASE WHEN status = 'DEGRADED' THEN 1 ELSE 0 END) AS count_of_degraded,
-        SUM(CASE WHEN status = 'MAINTENANCE' THEN 1 ELSE 0 END) AS count_of_maintenance,
-        AVG(latency) AS avg_latency,
-				MAX(latency) AS max_latency,
-				MIN(latency) AS min_latency
-      FROM monitoring_data
-      WHERE ${tagClause} AND timestamp >= ? AND timestamp < ?
-      GROUP BY ts
-      ORDER BY ts ASC
-    `;
-
-    // Bindings:
-    // 1-4: tsExpression parameters (start, interval, interval, start)
-    // 5+: WHERE clause parameters (tag(s), start, end)
-    const bindings = [
-      startTimestamp,
-      intervalInSeconds,
-      intervalInSeconds,
-      startTimestamp,
-      ...(isArray ? monitorTag : [monitorTag]),
-      startTimestamp,
-      endTimestamp,
-    ];
-
-    const result = await this.knex.raw(sql, bindings);
-
-    // Handle different database drivers:
-    // - SQLite (better-sqlite3): returns array directly
-    // - PostgreSQL: returns { rows: [...] }
-    // - MySQL: returns [rows, fields] where rows is an array
-    let rows: any[];
-    if (Array.isArray(result)) {
-      // SQLite or MySQL (MySQL returns [rows, fields])
-      rows = Array.isArray(result[0]) ? result[0] : result;
-    } else {
-      // PostgreSQL
-      rows = result.rows || [];
-    }
-
-    return rows.map((row: any) => ({
-      ts: Number(row.ts),
-      countOfUp: Number(row.count_of_up) || 0,
-      countOfDown: Number(row.count_of_down) || 0,
-      countOfDegraded: Number(row.count_of_degraded) || 0,
-      countOfMaintenance: Number(row.count_of_maintenance) || 0,
-      avgLatency: Number(row.avg_latency) || 0,
-      maxLatency: Number(row.max_latency) || 0,
-      minLatency: Number(row.min_latency) || 0,
-    }));
+    return Array.from(byTs.values())
+      .sort((a, b) => a.ts - b.ts)
+      .map(toTimestampStatusCount);
   }
 
   /**
@@ -595,60 +600,16 @@ export class MonitoringRepository extends BaseRepository {
       return [];
     }
 
-    const endTimestamp = startTimestamp + numberOfPoints * intervalInSeconds;
-
-    const client = (this.knex.client as any).config.client;
-    const isSQLite = client === "better-sqlite3" || client === "sqlite3";
-
-    const tsExpression = isSQLite ? `CAST((timestamp - ?) / ? AS INT) * ? + ?` : `FLOOR((timestamp - ?) / ?) * ? + ?`;
-
-    const sql = `
-      SELECT
-        monitor_tag,
-        ${tsExpression} as ts,
-        SUM(CASE WHEN status = 'UP' THEN 1 ELSE 0 END) AS count_of_up,
-        SUM(CASE WHEN status = 'DOWN' THEN 1 ELSE 0 END) AS count_of_down,
-        SUM(CASE WHEN status = 'DEGRADED' THEN 1 ELSE 0 END) AS count_of_degraded,
-        SUM(CASE WHEN status = 'MAINTENANCE' THEN 1 ELSE 0 END) AS count_of_maintenance,
-        AVG(latency) AS avg_latency,
-        MAX(latency) AS max_latency,
-        MIN(latency) AS min_latency
-      FROM monitoring_data
-      WHERE monitor_tag IN (${monitorTags.map(() => "?").join(", ")}) AND timestamp >= ? AND timestamp < ?
-      GROUP BY monitor_tag, ts
-      ORDER BY monitor_tag ASC, ts ASC
-    `;
-
-    const bindings = [
+    // Served from the 15-minute rollup below its watermark, raw rows above it
+    // (see monitoringRollup.ts). Ordered by monitor_tag, then ts.
+    const grouped = await aggregateWithRollup(
+      this.knex,
+      monitorTags,
       startTimestamp,
       intervalInSeconds,
-      intervalInSeconds,
-      startTimestamp,
-      ...monitorTags,
-      startTimestamp,
-      endTimestamp,
-    ];
-
-    const result = await this.knex.raw(sql, bindings);
-
-    let rows: any[];
-    if (Array.isArray(result)) {
-      rows = Array.isArray(result[0]) ? result[0] : result;
-    } else {
-      rows = result.rows || [];
-    }
-
-    return rows.map((row: any) => ({
-      monitor_tag: row.monitor_tag,
-      ts: Number(row.ts),
-      countOfUp: Number(row.count_of_up) || 0,
-      countOfDown: Number(row.count_of_down) || 0,
-      countOfDegraded: Number(row.count_of_degraded) || 0,
-      countOfMaintenance: Number(row.count_of_maintenance) || 0,
-      avgLatency: Number(row.avg_latency) || 0,
-      maxLatency: Number(row.max_latency) || 0,
-      minLatency: Number(row.min_latency) || 0,
-    }));
+      numberOfPoints,
+    );
+    return grouped.map((row) => ({ monitor_tag: row.monitor_tag, ...toTimestampStatusCount(row) }));
   }
 
   /**
