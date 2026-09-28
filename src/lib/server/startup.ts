@@ -3,6 +3,7 @@ import version from "../version.js";
 import mainScheduler from "./schedulers/appScheduler.js";
 import maintenanceScheduler from "./schedulers/maintenanceScheduler.js";
 import dailyCleanupScheduler from "./schedulers/dailyCleanup.js";
+import monitoringRollupScheduler from "./schedulers/monitoringRollup.js";
 
 process.env.TZ = "UTC";
 
@@ -10,6 +11,7 @@ async function Startup(): Promise<void> {
   await mainScheduler.start();
   await maintenanceScheduler.start();
   await dailyCleanupScheduler.start();
+  await monitoringRollupScheduler.start();
 
   const runtimeVersion = version();
 

@@ -73,6 +73,7 @@ class DbImpl {
   backfillConfirmedStatus!: MonitoringRepository["backfillConfirmedStatus"];
   updateMonitoringData!: MonitoringRepository["updateMonitoringData"];
   deleteMonitorDataByTag!: MonitoringRepository["deleteMonitorDataByTag"];
+  advanceMonitoringRollup!: MonitoringRepository["advanceMonitoringRollup"];
   getStatusCountsByInterval!: MonitoringRepository["getStatusCountsByInterval"];
   getStatusCountsByIntervalGroupedByMonitor!: MonitoringRepository["getStatusCountsByIntervalGroupedByMonitor"];
   getStatusCountsForLastN!: MonitoringRepository["getStatusCountsForLastN"];
@@ -439,6 +440,7 @@ class DbImpl {
     this.backfillConfirmedStatus = this.monitoring.backfillConfirmedStatus.bind(this.monitoring);
     this.updateMonitoringData = this.monitoring.updateMonitoringData.bind(this.monitoring);
     this.deleteMonitorDataByTag = this.monitoring.deleteMonitorDataByTag.bind(this.monitoring);
+    this.advanceMonitoringRollup = this.monitoring.advanceMonitoringRollup.bind(this.monitoring);
     this.getStatusCountsByInterval = this.monitoring.getStatusCountsByInterval.bind(this.monitoring);
     this.getStatusCountsByIntervalGroupedByMonitor = this.monitoring.getStatusCountsByIntervalGroupedByMonitor.bind(
       this.monitoring,
