@@ -33,15 +33,21 @@ export async function up(knex: Knex): Promise<void> {
     });
   }
 
-  // Single-row bookkeeping: every bucket below `watermark` is materialised in
-  // monitoring_data_rollup; everything at or above it is read from raw rows.
+  // Single-row bookkeeping: every bucket in [floor, watermark) is materialised
+  // in monitoring_data_rollup; everything outside it is read from raw rows.
+  // The row is seeded here so the rollup's row lock always has a row to lock.
   if (!(await knex.schema.hasTable("monitoring_data_rollup_state"))) {
     await knex.schema.createTable("monitoring_data_rollup_state", (table) => {
       table.integer("id").primary();
       table.integer("watermark").nullable();
+      table.integer("floor").nullable();
       table.integer("updated_at").notNullable().defaultTo(0);
     });
   }
+  await knex("monitoring_data_rollup_state")
+    .insert({ id: 1, watermark: null, floor: null, updated_at: 0 })
+    .onConflict("id")
+    .ignore();
 }
 
 export async function down(knex: Knex): Promise<void> {

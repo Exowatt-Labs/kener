@@ -13,7 +13,7 @@ import {
   advanceRollup,
   aggregateWithRollup,
   deleteRollupRange,
-  getCachedRollupWatermark,
+  mayBeBelowWatermark,
   rebuildRollupRange,
   type AdvanceRollupResult,
   type GroupedStatusSums,
@@ -68,9 +68,8 @@ export class MonitoringRepository extends BaseRepository {
       .merge({ status, latency, type, error_message, raw_status });
 
     // Live inserts land above the rollup watermark; only a late/back-dated one
-    // needs its already-materialised bucket re-derived.
-    const watermark = await getCachedRollupWatermark(this.knex).catch(() => null);
-    if (watermark !== null && timestamp < watermark) {
+    // needs its possibly-materialised bucket re-derived.
+    if (mayBeBelowWatermark(timestamp, Math.floor(Date.now() / 1000))) {
       await rebuildRollupRange(this.knex, timestamp, timestamp + 1, [monitor_tag]);
     }
 

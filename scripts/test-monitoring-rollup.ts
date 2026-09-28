@@ -14,7 +14,6 @@ import {
   ROLLUP_SETTLE_SECONDS,
   floorBucket,
   getRollupWatermark,
-  resetRollupWatermarkCache,
 } from "../src/lib/server/db/repositories/monitoringRollup.js";
 
 const DAY = 86400;
@@ -174,8 +173,7 @@ const main = async () => {
   await repo.deleteMonitorDataByTag("beta", now - 6 * DAY + 100, now - 6 * DAY + 3 * 3600);
   await check("after-ranged-delete");
 
-  // A fresh process (cold watermark cache) still sees a back-dated insert.
-  resetRollupWatermarkCache();
+  // A back-dated insert (older than the settle window) is re-derived.
   await repo.insertMonitoringData({
     monitor_tag: "gamma",
     timestamp: now - 3 * DAY + 45,
@@ -199,6 +197,37 @@ const main = async () => {
   const afterEdit = await repo.getStatusCountsByIntervalGroupedByMonitor(TAGS, endOfDay - 30 * DAY, DAY, 30);
   const olderThanEdge = (r: any[]) => r.filter((x) => x.ts < now - 8 * DAY - DAY);
   approxEqual(olderThanEdge(afterEdit), olderThanEdge(before), "older-buckets-kept");
+  // …and a failure fallback that lowered the watermark below the oldest raw row
+  // must not re-derive (and erase) the retained history when it re-advances.
+  await db("monitoring_data_rollup_state").update({ watermark: floorBucket(now - 10 * DAY) });
+  for (let k = 0; k < 50 && (await repo.advanceMonitoringRollup(now)).chunks > 0; k++);
+  const afterLowered = await repo.getStatusCountsByIntervalGroupedByMonitor(TAGS, endOfDay - 30 * DAY, DAY, 30);
+  approxEqual(olderThanEdge(afterLowered), olderThanEdge(before), "retained-after-lowered-watermark");
+
+  // 4b. A historical edit that lands while the scheduler is mid-chunk is not lost.
+  await db("monitoring_data_rollup_state").update({ watermark: floorBucket(now - 3 * DAY) });
+  const editTs = floorBucket(now - 3 * DAY) + 3600;
+  let pending: Promise<unknown> | null = null;
+  const onQuery = (q: any) => {
+    if (
+      !pending &&
+      /INSERT INTO monitoring_data_rollup/.test(q.sql) &&
+      q.bindings?.[0] === floorBucket(now - 3 * DAY)
+    ) {
+      pending = repo.updateMonitoringData("beta", editTs, editTs + 600, "UP", "MANUAL", 2);
+    }
+  };
+  db.on("query", onQuery);
+  await repo.advanceMonitoringRollup(now);
+  db.off("query", onQuery);
+  assert.ok(pending, "edit was injected mid-chunk");
+  await pending;
+  const raceStart = floorBucket(now - 3 * DAY);
+  approxEqual(
+    await repo.getStatusCountsByIntervalGroupedByMonitor(TAGS, raceStart, 900, 8),
+    await referenceGrouped(TAGS, raceStart, 900, 8),
+    "edit-during-advance",
+  );
 
   // 5. Live progression: advancing later still matches raw for the untrimmed window.
   await db("monitoring_data").insert(

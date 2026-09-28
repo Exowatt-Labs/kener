@@ -18,13 +18,17 @@ const getQueue = () => {
 const addWorker = () => {
   if (worker) return worker;
 
-  worker = q.createWorker(getQueue(), async (_job: Job) => {
-    const result = await db.advanceMonitoringRollup(GetMinuteStartNowTimestampUTC());
-    if (result.chunks > 0 && result.previousWatermark === null) {
-      console.log(`monitoring_data_rollup: backfill started, watermark=${result.watermark}`);
-    }
-    return result;
-  });
+  worker = q.createWorker(
+    getQueue(),
+    async (_job: Job) => {
+      const result = await db.advanceMonitoringRollup(GetMinuteStartNowTimestampUTC());
+      if (result.chunks > 0 && result.previousWatermark === null) {
+        console.log(`monitoring_data_rollup: backfill started, watermark=${result.watermark}`);
+      }
+      return result;
+    },
+    { concurrency: 1 },
+  );
 
   worker.on("failed", (_job: Job | undefined, err: Error) => {
     console.error("Monitoring rollup scheduler failed:", err);

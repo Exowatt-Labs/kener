@@ -3,30 +3,37 @@ import type { Knex as KnexType } from "knex";
 /**
  * 15-minute rollup of monitoring_data for the day-bar aggregation.
  *
- * Invariant: every bucket with bucket_ts < watermark is materialised in
- * monitoring_data_rollup from the raw rows that existed when it was last
- * derived; everything at or above the watermark is read from raw rows. Reads
- * split at the watermark, so they are correct whether or not the rollup has
- * caught up — an empty rollup is simply the old all-raw query.
+ * State (one row): every bucket in [floor, watermark) is materialised in
+ * monitoring_data_rollup; everything outside that span is read from raw rows.
+ * Reads split on it, so they are correct whether or not the rollup has caught
+ * up — an empty rollup is simply the old all-raw query.
+ *
+ * Concurrency: every mutation of the rollup or its state runs in a transaction
+ * whose FIRST statement is a no-op UPDATE of the state row. That takes the row
+ * lock on Postgres/MySQL (and the write lock on SQLite) before anything is
+ * read, so the scheduler advancing the watermark and a request-path rebuild
+ * can never interleave: a raw edit either commits before the scheduler's
+ * INSERT…SELECT reads it, or its rebuild runs after the watermark moved and
+ * re-derives the bucket.
  *
  * Every write to monitoring_data goes through MonitoringRepository, which calls
- * rebuildRollupRange() for any write below the watermark, so a historical edit
- * (incident/maintenance overlay, confirmation backfill, late push, delete) is
- * re-derived in place instead of going stale. If that re-derivation fails, the
- * watermark is lowered below the edit instead — reads then fall back to raw for
+ * rebuildRollupRange() for any write that may land below the watermark, so a
+ * historical edit (incident/maintenance overlay, confirmation backfill, late
+ * push, delete) is re-derived in place instead of going stale. If that fails,
+ * the watermark is lowered to the edit instead — reads fall back to raw for
  * that span (slower, never wrong) and the scheduler re-materialises it.
  *
- * Raw rows removed by a retention sweep (Kener's own dailyCleanup or an external
- * one) do NOT remove rollup rows: the rollup keeps ROLLUP_RETENTION_DAYS of day
- * bars even when raw history is shorter. Re-derivation is therefore clipped to
- * the oldest surviving raw row, so it can never overwrite a retained bucket with
- * the empty result of a trimmed range.
+ * Raw rows removed by a retention sweep (Kener's own dailyCleanup or an
+ * external one) do NOT remove rollup rows: the rollup keeps
+ * ROLLUP_RETENTION_DAYS of day bars even when raw history is shorter. Nothing
+ * ever re-derives below the bucket holding the oldest surviving raw row, so a
+ * trimmed range can never overwrite retained buckets with an empty result.
  */
 
 export const ROLLUP_BUCKET_SECONDS = 900;
 /** A bucket is materialised only once it closed this long ago (late writes land raw). */
 export const ROLLUP_SETTLE_SECONDS = 300;
-/** Each advance re-derives this much history below the watermark, as a backstop. */
+/** Each watermark advance first re-derives this much history below it, as a backstop. */
 export const ROLLUP_RECHECK_SECONDS = 3600;
 export const ROLLUP_CHUNK_SECONDS = 6 * 3600;
 export const ROLLUP_MAX_CHUNKS_PER_RUN = 8;
@@ -48,7 +55,14 @@ export interface GroupedStatusSums {
   latencyMax: number | null;
 }
 
-const isSQLite = (knex: KnexType): boolean => {
+export interface RollupState {
+  watermark: number | null;
+  floor: number | null;
+}
+
+type Q = KnexType | KnexType.Transaction;
+
+const isSQLite = (knex: Q): boolean => {
   const client = (knex.client as any).config.client;
   return client === "better-sqlite3" || client === "sqlite3";
 };
@@ -80,116 +94,137 @@ export const canUseRollup = (startTimestamp: number, intervalInSeconds: number):
   startTimestamp % ROLLUP_BUCKET_SECONDS === 0 &&
   intervalInSeconds % ROLLUP_BUCKET_SECONDS === 0;
 
-// In-process hint for the insert path, so a live insert (always above the
-// watermark) costs no extra query. `undefined` = not loaded yet.
-let cachedWatermark: number | null | undefined;
+/**
+ * A write at `timestamp` can only touch a materialised bucket if it is older
+ * than the newest bucket the scheduler may have rolled up. Live inserts (the
+ * current minute) skip the rollup entirely — no extra query, no cache.
+ */
+export const mayBeBelowWatermark = (timestamp: number, nowTs: number): boolean =>
+  timestamp < floorBucket(nowTs - ROLLUP_SETTLE_SECONDS);
 
-export const resetRollupWatermarkCache = (): void => {
-  cachedWatermark = undefined;
-};
-
-export const getRollupWatermark = async (knex: KnexType): Promise<number | null> => {
+export const getRollupState = async (knex: Q): Promise<RollupState> => {
   const row = await knex("monitoring_data_rollup_state").where("id", STATE_ID).first();
-  const watermark = nullableNumber(row?.watermark);
-  cachedWatermark = watermark;
-  return watermark;
+  return { watermark: nullableNumber(row?.watermark), floor: nullableNumber(row?.floor) };
 };
 
-export const getCachedRollupWatermark = async (knex: KnexType): Promise<number | null> => {
-  if (cachedWatermark === undefined) {
-    return await getRollupWatermark(knex);
-  }
-  return cachedWatermark;
-};
+export const getRollupWatermark = async (knex: Q): Promise<number | null> => (await getRollupState(knex)).watermark;
 
-const setRollupWatermark = async (knex: KnexType, watermark: number | null): Promise<void> => {
+const writeState = async (trx: Q, state: RollupState): Promise<void> => {
   const updated_at = Math.floor(Date.now() / 1000);
-  await knex("monitoring_data_rollup_state")
-    .insert({ id: STATE_ID, watermark, updated_at })
+  await trx("monitoring_data_rollup_state")
+    .insert({ id: STATE_ID, watermark: state.watermark, floor: state.floor, updated_at })
     .onConflict("id")
-    .merge({ watermark, updated_at });
-  cachedWatermark = watermark;
+    .merge({ watermark: state.watermark, floor: state.floor, updated_at });
 };
+
+/**
+ * Run `fn` holding the rollup lock (see the header). The no-op UPDATE is the
+ * first statement so the lock is taken before any state or raw row is read.
+ */
+const withRollupLock = async <T>(knex: KnexType, fn: (trx: KnexType.Transaction) => Promise<T>): Promise<T> =>
+  await knex.transaction(async (trx: KnexType.Transaction) => {
+    await trx("monitoring_data_rollup_state")
+      .where("id", STATE_ID)
+      .update({ updated_at: trx.ref("updated_at") });
+    return await fn(trx);
+  });
 
 const tagClause = (tags: string[] | undefined): { sql: string; bindings: string[] } =>
   tags && tags.length > 0
     ? { sql: ` AND monitor_tag IN (${tags.map(() => "?").join(", ")})`, bindings: tags }
     : { sql: "", bindings: [] };
 
-/** Replace buckets [from, to) — optionally only for `tags` — with a fresh derivation from raw rows. */
-const materialise = async (knex: KnexType, from: number, to: number, tags?: string[]): Promise<void> => {
+/**
+ * Replace buckets [from, to) — optionally only for `tags` — with a fresh
+ * derivation from raw rows. Caller must hold the rollup lock.
+ */
+const materialise = async (trx: KnexType.Transaction, from: number, to: number, tags?: string[]): Promise<void> => {
   if (from >= to) return;
-  const bucketExpr = isSQLite(knex)
+  const bucketExpr = isSQLite(trx)
     ? `CAST(timestamp / ${ROLLUP_BUCKET_SECONDS} AS INT) * ${ROLLUP_BUCKET_SECONDS}`
     : `FLOOR(timestamp / ${ROLLUP_BUCKET_SECONDS}) * ${ROLLUP_BUCKET_SECONDS}`;
   const tc = tagClause(tags);
 
-  await knex.transaction(async (trx: KnexType.Transaction) => {
-    const del = trx("monitoring_data_rollup").where("bucket_ts", ">=", from).where("bucket_ts", "<", to);
-    if (tags && tags.length > 0) del.whereIn("monitor_tag", tags);
-    await del.del();
+  const del = trx("monitoring_data_rollup").where("bucket_ts", ">=", from).where("bucket_ts", "<", to);
+  if (tags && tags.length > 0) del.whereIn("monitor_tag", tags);
+  await del.del();
 
-    await trx.raw(
-      `
-      INSERT INTO monitoring_data_rollup (
-        monitor_tag, bucket_ts, count_of_up, count_of_down, count_of_degraded, count_of_maintenance,
-        latency_sum, latency_count, latency_min, latency_max
-      )
-      SELECT
-        monitor_tag,
-        ${bucketExpr} AS bucket_ts,
-        SUM(CASE WHEN status = 'UP' THEN 1 ELSE 0 END),
-        SUM(CASE WHEN status = 'DOWN' THEN 1 ELSE 0 END),
-        SUM(CASE WHEN status = 'DEGRADED' THEN 1 ELSE 0 END),
-        SUM(CASE WHEN status = 'MAINTENANCE' THEN 1 ELSE 0 END),
-        SUM(latency),
-        COUNT(latency),
-        MIN(latency),
-        MAX(latency)
-      FROM monitoring_data
-      WHERE timestamp >= ? AND timestamp < ?${tc.sql}
-      GROUP BY monitor_tag, ${bucketExpr}
-      `,
-      [from, to, ...tc.bindings],
-    );
-  });
+  await trx.raw(
+    `
+    INSERT INTO monitoring_data_rollup (
+      monitor_tag, bucket_ts, count_of_up, count_of_down, count_of_degraded, count_of_maintenance,
+      latency_sum, latency_count, latency_min, latency_max
+    )
+    SELECT
+      monitor_tag,
+      ${bucketExpr} AS bucket_ts,
+      SUM(CASE WHEN status = 'UP' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN status = 'DOWN' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN status = 'DEGRADED' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN status = 'MAINTENANCE' THEN 1 ELSE 0 END),
+      SUM(latency),
+      COUNT(latency),
+      MIN(latency),
+      MAX(latency)
+    FROM monitoring_data
+    WHERE timestamp >= ? AND timestamp < ?${tc.sql}
+    GROUP BY monitor_tag, ${bucketExpr}
+    `,
+    [from, to, ...tc.bindings],
+  );
 };
 
-const oldestRawTimestamp = async (knex: KnexType): Promise<number | null> => {
-  const row = await knex("monitoring_data").min("timestamp as min_ts").first();
+const oldestRawTimestamp = async (q: Q): Promise<number | null> => {
+  const row = await q("monitoring_data").min("timestamp as min_ts").first();
   return nullableNumber((row as any)?.min_ts);
 };
 
 /**
+ * Lowest bucket that may be re-derived from raw: never below the rollup floor,
+ * and never below the bucket holding the oldest surviving raw row (below it the
+ * rollup is the only copy left; re-deriving that one edge bucket can drop at
+ * most its trimmed part — under 15 min).
+ */
+const rederiveFloor = (state: RollupState, oldestRaw: number | null): number | null => {
+  if (oldestRaw === null || state.floor === null) return null;
+  return Math.max(state.floor, floorBucket(oldestRaw));
+};
+
+/** Fallback when an in-place re-derivation fails: serve [from, …) raw until the scheduler catches up. */
+const lowerWatermarkTo = async (knex: KnexType, from: number): Promise<void> => {
+  try {
+    await withRollupLock(knex, async (trx) => {
+      const state = await getRollupState(trx);
+      if (state.watermark === null) return;
+      const floor = rederiveFloor(state, await oldestRawTimestamp(trx));
+      if (floor === null) return;
+      const lowered = Math.max(floorBucket(from), floor);
+      if (lowered < state.watermark) await writeState(trx, { ...state, watermark: lowered });
+    });
+  } catch (err) {
+    console.error("monitoring_data_rollup: failed to lower watermark", err);
+  }
+};
+
+/**
  * Re-derive already-materialised buckets overlapping raw timestamps [from, to)
- * after a write to them. No-op above the watermark (those spans are read raw).
+ * after a write to them. No-op for spans that are read raw anyway.
  * Never throws: on failure it lowers the watermark so reads fall back to raw.
  */
 export const rebuildRollupRange = async (knex: KnexType, from: number, to: number, tags?: string[]): Promise<void> => {
-  let watermark: number | null = null;
   try {
-    watermark = await getCachedRollupWatermark(knex);
-    if (watermark === null) return;
-    const start = floorBucket(from);
-    const end = Math.min(ceilBucket(to), watermark);
-    if (start >= end) return;
-
-    // Clip to the bucket holding the oldest surviving raw row: below it the raw
-    // history was trimmed and the rollup is the only copy left. (Re-deriving
-    // that one edge bucket can drop at most its trimmed part — under 15 min.)
-    const oldest = await oldestRawTimestamp(knex);
-    if (oldest === null) return;
-    await materialise(knex, Math.max(start, floorBucket(oldest)), end, tags);
+    await withRollupLock(knex, async (trx) => {
+      const state = await getRollupState(trx);
+      if (state.watermark === null) return;
+      const floor = rederiveFloor(state, await oldestRawTimestamp(trx));
+      if (floor === null) return;
+      const start = Math.max(floorBucket(from), floor);
+      const end = Math.min(ceilBucket(to), state.watermark);
+      await materialise(trx, start, end, tags);
+    });
   } catch (err) {
     console.error("monitoring_data_rollup: in-place rebuild failed; lowering watermark", err);
-    try {
-      if (watermark !== null) {
-        await setRollupWatermark(knex, Math.min(watermark, floorBucket(from)));
-      }
-    } catch (innerErr) {
-      console.error("monitoring_data_rollup: failed to lower watermark", innerErr);
-      cachedWatermark = undefined;
-    }
+    await lowerWatermarkTo(knex, from);
   }
 };
 
@@ -201,66 +236,89 @@ export interface AdvanceRollupResult {
 }
 
 /**
- * Scheduler entry point: re-derive the last hour below the watermark, then move
- * the watermark forward in bounded chunks toward (now - settle). The first run
- * backfills from the oldest raw row, a few chunks per run.
+ * Scheduler entry point: when a bucket has settled, re-derive the last hour
+ * below the watermark, then move the watermark forward in bounded chunks
+ * toward (now - settle). The first run backfills from the oldest raw row, a
+ * few chunks per run. Safe to run concurrently (every step takes the lock and
+ * re-reads the state).
  */
 export const advanceRollup = async (knex: KnexType, nowTs: number): Promise<AdvanceRollupResult> => {
   const target = floorBucket(nowTs - ROLLUP_SETTLE_SECONDS);
   const retentionFloor = floorBucket(nowTs - ROLLUP_RETENTION_DAYS * 86400);
-  const previousWatermark = await getRollupWatermark(knex);
-  let watermark = previousWatermark;
 
-  if (watermark === null) {
-    const oldest = await oldestRawTimestamp(knex);
-    watermark = oldest === null ? target : Math.max(floorBucket(oldest), retentionFloor);
-    // Fresh start: nothing at or above the new watermark may be trusted.
-    await knex("monitoring_data_rollup").where("bucket_ts", ">=", watermark).del();
-    await setRollupWatermark(knex, watermark);
+  const previousWatermark = await withRollupLock(knex, async (trx) => {
+    const state = await getRollupState(trx);
+    if (state.watermark === null) {
+      const oldest = await oldestRawTimestamp(trx);
+      const start = oldest === null ? target : Math.min(target, Math.max(floorBucket(oldest), retentionFloor));
+      // Fresh start: nothing at or above the new floor may be trusted.
+      await trx("monitoring_data_rollup").where("bucket_ts", ">=", start).del();
+      await writeState(trx, { watermark: start, floor: start });
+    } else if (state.watermark > target) {
+      // Clock went backwards: don't claim buckets we can't vouch for.
+      await writeState(trx, { ...state, watermark: target });
+    }
+    return state.watermark;
+  });
+
+  const current = await getRollupWatermark(knex);
+  if (current !== null && current < target) {
+    await rebuildRollupRange(knex, current - ROLLUP_RECHECK_SECONDS, current);
   }
-
-  if (watermark > target) {
-    // Clock went backwards (or target shrank): don't claim buckets we can't vouch for.
-    watermark = target;
-    await setRollupWatermark(knex, watermark);
-  }
-
-  await rebuildRollupRange(knex, watermark - ROLLUP_RECHECK_SECONDS, watermark);
 
   let chunks = 0;
-  while (watermark < target && chunks < ROLLUP_MAX_CHUNKS_PER_RUN) {
-    const next = Math.min(watermark + ROLLUP_CHUNK_SECONDS, target);
-    await materialise(knex, watermark, next);
-    await setRollupWatermark(knex, next);
-    watermark = next;
+  let watermark = current;
+  while (chunks < ROLLUP_MAX_CHUNKS_PER_RUN) {
+    const advanced = await withRollupLock(knex, async (trx) => {
+      const state = await getRollupState(trx);
+      if (state.watermark === null || state.floor === null || state.watermark >= target) return null;
+      let from = state.watermark;
+      // Below the oldest surviving raw row only the rollup holds data: skip
+      // ahead instead of re-deriving (and erasing) it.
+      const oldest = await oldestRawTimestamp(trx);
+      if (oldest !== null && from < floorBucket(oldest)) from = Math.min(floorBucket(oldest), target);
+      const next = Math.min(from + ROLLUP_CHUNK_SECONDS, target);
+      await materialise(trx, from, next);
+      await writeState(trx, { ...state, watermark: next });
+      return next;
+    });
+    if (advanced === null) break;
+    watermark = advanced;
     chunks++;
   }
 
-  const prunedRows = await knex("monitoring_data_rollup").where("bucket_ts", "<", retentionFloor).del();
+  const prunedRows = await withRollupLock(knex, async (trx) => {
+    const state = await getRollupState(trx);
+    const pruned = await trx("monitoring_data_rollup").where("bucket_ts", "<", retentionFloor).del();
+    if (state.floor !== null && state.floor < retentionFloor) {
+      await writeState(trx, { ...state, floor: Math.min(retentionFloor, state.watermark ?? retentionFloor) });
+    }
+    return pruned;
+  });
 
   return { watermark, previousWatermark, chunks, prunedRows };
 };
 
 /**
- * Mirror an explicit raw delete: drop every rollup bucket overlapping the
- * deleted span (so a deliberate delete also removes retained history), then
- * re-derive the partially-covered edge buckets from whatever raw rows remain.
- * `end` is inclusive, matching deleteMonitorDataByTag.
+ * Mirror an explicit raw delete (`end` inclusive, as deleteMonitorDataByTag):
+ * drop the rollup buckets wholly inside the deleted span — so a deliberate
+ * delete also removes retained history — then re-derive the partially-covered
+ * edge buckets from the raw rows that remain.
  */
 export const deleteRollupRange = async (knex: KnexType, tag?: string, start?: number, end?: number): Promise<void> => {
   try {
-    const query = knex("monitoring_data_rollup");
-    if (tag) query.where("monitor_tag", tag);
-    if (start !== undefined) query.where("bucket_ts", ">=", floorBucket(start));
-    if (end !== undefined) query.where("bucket_ts", "<=", end);
-    await query.del();
+    await withRollupLock(knex, async (trx) => {
+      const query = trx("monitoring_data_rollup");
+      if (tag) query.where("monitor_tag", tag);
+      if (start !== undefined) query.where("bucket_ts", ">=", ceilBucket(start));
+      if (end !== undefined) query.where("bucket_ts", "<=", end + 1 - ROLLUP_BUCKET_SECONDS);
+      await query.del();
+    });
   } catch (err) {
-    console.error("monitoring_data_rollup: delete mirror failed; lowering watermark", err);
-    cachedWatermark = undefined;
-    const watermark = await getCachedRollupWatermark(knex).catch(() => null);
-    if (watermark !== null) {
-      await setRollupWatermark(knex, Math.min(watermark, floorBucket(start ?? 0))).catch(() => {});
-    }
+    console.error("monitoring_data_rollup: delete mirror failed", err);
+    // A ranged delete can fall back to raw for its span; an unbounded one
+    // (monitor deletion) has nothing safe to lower to and is left as is.
+    if (start !== undefined) await lowerWatermarkTo(knex, start);
     return;
   }
   const tags = tag ? [tag] : undefined;
@@ -390,8 +448,8 @@ export const mergeSums = (...parts: GroupedStatusSums[][]): GroupedStatusSums[] 
 };
 
 /**
- * Grouped status sums over [startTimestamp, startTimestamp + points*interval),
- * served from the rollup below the watermark and from raw rows above it.
+ * Grouped status sums over [startTimestamp, startTimestamp + points*interval):
+ * served from the rollup inside [floor, watermark) and from raw rows outside it.
  */
 export const aggregateWithRollup = async (
   knex: KnexType,
@@ -401,16 +459,19 @@ export const aggregateWithRollup = async (
   numberOfPoints: number,
 ): Promise<GroupedStatusSums[]> => {
   const end = startTimestamp + numberOfPoints * intervalInSeconds;
-  let split = startTimestamp;
+  let rollFrom = startTimestamp;
+  let rollTo = startTimestamp;
   if (canUseRollup(startTimestamp, intervalInSeconds)) {
-    const watermark = await getRollupWatermark(knex);
-    if (watermark !== null) {
-      split = Math.max(startTimestamp, Math.min(watermark, end));
+    const state = await getRollupState(knex);
+    if (state.watermark !== null && state.floor !== null) {
+      rollFrom = Math.min(Math.max(startTimestamp, state.floor), end);
+      rollTo = Math.max(rollFrom, Math.min(state.watermark, end));
     }
   }
-  const [rolled, raw] = await Promise.all([
-    aggregateRollup(knex, tags, startTimestamp, intervalInSeconds, startTimestamp, split),
-    aggregateRaw(knex, tags, startTimestamp, intervalInSeconds, split, end),
+  const [before, rolled, after] = await Promise.all([
+    aggregateRaw(knex, tags, startTimestamp, intervalInSeconds, startTimestamp, rollFrom),
+    aggregateRollup(knex, tags, startTimestamp, intervalInSeconds, rollFrom, rollTo),
+    aggregateRaw(knex, tags, startTimestamp, intervalInSeconds, rollTo, end),
   ]);
-  return mergeSums(rolled, raw);
+  return mergeSums(before, rolled, after);
 };
