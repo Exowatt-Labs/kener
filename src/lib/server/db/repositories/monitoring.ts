@@ -14,6 +14,7 @@ import {
   aggregateWithRollup,
   deleteRollupRange,
   mayBeBelowWatermark,
+  oldestRawTimestamp,
   rebuildRollupRange,
   type AdvanceRollupResult,
   type GroupedStatusSums,
@@ -530,8 +531,9 @@ export class MonitoringRepository extends BaseRepository {
     if (end !== undefined) {
       query.where("timestamp", "<=", end);
     }
+    const oldestBeforeDelete = await oldestRawTimestamp(this.knex).catch(() => null);
     const deleted = await query.del();
-    await deleteRollupRange(this.knex, tag, start, end);
+    await deleteRollupRange(this.knex, tag, start, end, oldestBeforeDelete);
     return deleted;
   }
 

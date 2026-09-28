@@ -174,7 +174,7 @@ const materialise = async (trx: KnexType.Transaction, from: number, to: number, 
   );
 };
 
-const oldestRawTimestamp = async (q: Q): Promise<number | null> => {
+export const oldestRawTimestamp = async (q: Q): Promise<number | null> => {
   const row = await q("monitoring_data").min("timestamp as min_ts").first();
   return nullableNumber((row as any)?.min_ts);
 };
@@ -211,12 +211,27 @@ const lowerWatermarkTo = async (knex: KnexType, from: number): Promise<void> => 
  * after a write to them. No-op for spans that are read raw anyway.
  * Never throws: on failure it lowers the watermark so reads fall back to raw.
  */
-export const rebuildRollupRange = async (knex: KnexType, from: number, to: number, tags?: string[]): Promise<void> => {
+export const rebuildRollupRange = async (
+  knex: KnexType,
+  from: number,
+  to: number,
+  tags?: string[],
+  oldestRawBeforeWrite?: number | null,
+): Promise<void> => {
   try {
     await withRollupLock(knex, async (trx) => {
       const state = await getRollupState(trx);
       if (state.watermark === null) return;
-      const floor = rederiveFloor(state, await oldestRawTimestamp(trx));
+      // A delete can itself remove the oldest raw rows; clipping at the
+      // post-delete oldest would then skip the edge bucket it just changed.
+      const oldestNow = await oldestRawTimestamp(trx);
+      const oldest =
+        oldestRawBeforeWrite === undefined || oldestRawBeforeWrite === null
+          ? oldestNow
+          : oldestNow === null
+            ? oldestRawBeforeWrite
+            : Math.min(oldestNow, oldestRawBeforeWrite);
+      const floor = rederiveFloor(state, oldest);
       if (floor === null) return;
       const start = Math.max(floorBucket(from), floor);
       const end = Math.min(ceilBucket(to), state.watermark);
@@ -305,7 +320,13 @@ export const advanceRollup = async (knex: KnexType, nowTs: number): Promise<Adva
  * delete also removes retained history — then re-derive the partially-covered
  * edge buckets from the raw rows that remain.
  */
-export const deleteRollupRange = async (knex: KnexType, tag?: string, start?: number, end?: number): Promise<void> => {
+export const deleteRollupRange = async (
+  knex: KnexType,
+  tag?: string,
+  start?: number,
+  end?: number,
+  oldestRawBeforeDelete?: number | null,
+): Promise<void> => {
   try {
     await withRollupLock(knex, async (trx) => {
       const query = trx("monitoring_data_rollup");
@@ -322,8 +343,8 @@ export const deleteRollupRange = async (knex: KnexType, tag?: string, start?: nu
     return;
   }
   const tags = tag ? [tag] : undefined;
-  if (start !== undefined) await rebuildRollupRange(knex, start, start + 1, tags);
-  if (end !== undefined) await rebuildRollupRange(knex, end, end + 1, tags);
+  if (start !== undefined) await rebuildRollupRange(knex, start, start + 1, tags, oldestRawBeforeDelete);
+  if (end !== undefined) await rebuildRollupRange(knex, end, end + 1, tags, oldestRawBeforeDelete);
 };
 
 /**
