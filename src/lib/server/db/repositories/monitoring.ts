@@ -168,22 +168,21 @@ export class MonitoringRepository extends BaseRepository {
       return [];
     }
 
-    const latestPerMonitor = this.knex("monitoring_data")
-      .select("monitor_tag")
-      .max("timestamp as max_timestamp")
-      .whereIn("monitor_tag", monitor_tags)
-      .groupBy("monitor_tag")
-      .as("latest_per_monitor");
-
-    return await this.knex("monitoring_data as md")
-      .join(latestPerMonitor, function (this: KnexType.JoinClause) {
-        this.on("md.monitor_tag", "=", "latest_per_monitor.monitor_tag").andOn(
-          "md.timestamp",
-          "=",
-          "latest_per_monitor.max_timestamp",
-        );
-      })
-      .select("md.*");
+    // Ported from upstream Kener 27b99630 + 538bb25f. One newest-row lookup
+    // per unique tag — each a single descent of the (monitor_tag, timestamp)
+    // primary key. The previous MAX(timestamp) GROUP BY self-join took 2.5 s
+    // for 100 tags on the Exowatt SQLite DB (~20M rows), and it runs on every
+    // status-page SSR and monitor-bars request. Lookups run in small batches so
+    // a page with many monitors cannot queue more connection acquisitions than
+    // the pool can serve at once.
+    const uniqueTags = [...new Set(monitor_tags)];
+    const batchSize = 10;
+    const rows: (MonitoringData | undefined)[] = [];
+    for (let i = 0; i < uniqueTags.length; i += batchSize) {
+      const batch = uniqueTags.slice(i, i + batchSize);
+      rows.push(...(await Promise.all(batch.map((tag) => this.getLatestMonitoringData(tag)))));
+    }
+    return rows.filter((row): row is MonitoringData => row !== undefined);
   }
 
   async getLastHeartbeat(monitor_tag: string): Promise<MonitoringData | undefined> {
